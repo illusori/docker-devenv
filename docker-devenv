@@ -12,7 +12,7 @@ err_update_no_source=6
 err_update_no_write=7
 err_no_test_script=8
 
-DOCKER_DEVENV_UPDATE_SOURCE='https://github.com/illusori/docker-devenv/raw/master/docker-devenv'
+DOCKER_DEVENV_UPDATE_SOURCE='https://github.com/illusori/docker-devenv/raw/main/docker-devenv'
 
 _load_config() {
     if [ -f "$config_dir/config" ]; then
@@ -341,7 +341,7 @@ _cmd_update() {
 	echo "Updating from $source to $0"
 	# Exec to a new shell to modify the running script otherwise the buffered read of the
 	# currently executing script gets funky.
-	exec /bin/sh -c "curl '$source' --output '$0'"
+	exec /bin/sh -c "curl -L '$source' --output '$0'"
     fi
 }
 
