@@ -1,6 +1,6 @@
 # docker-devenv
 
-A context-aware use of docker as a development environment for languge-agnostic projects.
+A context-aware use of docker as a development environment for language-agnostic projects.
 
 ## Why?
 
