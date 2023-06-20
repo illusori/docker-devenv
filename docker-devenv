@@ -1,0 +1,421 @@
+#!/bin/sh
+
+version='0.1.0'
+prog_name=`basename -- "$0"`
+prog_dir=`dirname -- "$0"`
+config_dir="$HOME/.docker-devenv"
+plugins_dir="$config_dir/plugins"
+
+err_missing_project_variables=3
+err_no_run_script=5
+err_update_no_source=6
+err_update_no_write=7
+err_no_test_script=8
+
+DOCKER_DEVENV_UPDATE_SOURCE='https://github.com/illusori/docker-devenv/raw/master/docker-devenv'
+
+_load_config() {
+    if [ -f "$config_dir/config" ]; then
+	. "$config_dir/config"
+    fi
+    # FIXME: load project config from somewhere?
+    env_file="$prog_dir/env"
+    if [ -f "$env_file" ]; then
+        . "$env_file"
+    fi
+
+    [ -z "$PROJECT_APP" ] && _die $err_missing_project_variables "No \$PROJECT_APP environment variable defined."
+    [ -z "$DOCKER_USER" ] && _die $err_missing_project_variables "No \$DOCKER_USER environment variable defined."
+    [ -z "$DEPLOYMENT_STAGE" ] && _die $err_missing_project_variables "No \$DEPLOYMENT_STAGE environment variable defined."
+}
+
+_err() {
+    echo "$*" 1>&2
+}
+
+_die() {
+    errcode="$1"
+    shift
+    _err "$*"
+    exit "$errcode"
+}
+
+_log() {
+    if [ "$debug" -ge "$1" ]; then
+        shift;
+        _err "$*"
+    fi
+}
+
+_help_build() {
+    echo FIXME help build
+}
+
+_cmd_build() {
+    # Docker sniff, are we running inside the container build?
+    if in_build_container; then
+	if [ -f "$prog_dir/custom-build" ]; then
+	    . "$prog_dir/custom-build"
+	fi
+    elif in_development_stage && ! in_devenv_container ; then
+	echo "*** docker-devenv: building devenv image"
+	docker build \
+	    --build-arg "APP=$PROJECT_APP" \
+	    --target devenv \
+	    --tag "$DOCKER_USER/$PROJECT_APP-devenv:${1:-latest}" \
+	    --progress plain \
+	    $DOCKER_DEVENV_BUILD_ARGS \
+	    $DOCKER_DEVENV_BUILD_DEVENV_ARGS \
+	    .
+        # FIXME: probably don't want to start monitor here semantically.
+        _cmd_run
+    else
+        echo "*** docker-devenv: building runtime image"
+	# No need for --cache-from, that's only for caches on remote registries.
+	docker build \
+	    --build-arg "APP=$PROJECT_APP" \
+	    --tag "$DOCKER_USER/$PROJECT_APP:${1:-latest}" \
+	    --progress plain \
+            $DOCKER_DEVENV_BUILD_ARGS \
+            $DOCKER_DEVENV_BUILD_RUNTIME_ARGS \
+	    .
+    fi
+}
+
+_help_run() {
+    echo FIXME help run
+}
+
+_cmd_run() {
+    if in_runtime_container; then
+	if [ -f "$prog_dir/custom-run" ]; then
+	    . "$prog_dir/custom-run"
+	else
+	    _die $err_no_run_script "No run stage defined, make a bin/custom-run to do it."
+	fi
+    elif in_development_stage && ! in_devenv_container; then
+	# On the development machine but not in the devenv container. Run the devenv container.
+	exec docker run -it --rm \
+	    --env "DEPLOYMENT_STAGE=$DEPLOYMENT_STAGE" \
+	    --volume /var/run/docker.sock:/var/run/docker.sock \
+	    --volume `pwd`:/app \
+	    --name "$PROJECT_APP-devenv" \
+            $DOCKER_DEVENV_RUN_DEVENV_ARGS \
+	    "$DOCKER_USER/$PROJECT_APP-devenv:${1:-latest}"
+    else
+        # FIXME is -i ever needed here?
+	if in_devenv_container; then
+	    output_switches="-t"
+	else
+	    output_swithes="-it"
+	fi
+	exec docker run $output_switches --rm \
+	    --env "DEPLOYMENT_STAGE=$DEPLOYMENT_STAGE" \
+	    --name "$PROJECT_APP-runtime" \
+            $DOCKER_DEVENV_RUN_RUNTIME_ARGS \
+	    "$DOCKER_USER/$PROJECT_APP:${1:-latest}"
+    fi
+}
+
+_help_test() {
+    echo FIXME help run
+}
+
+_cmd_test() {
+    if in_devenv_container; then
+	if [ -f "$prog_dir/custom-test" ]; then
+            if [ "$MONITOR_CMD" = 1 ]; then
+                # Don't source this one, we don't want it to exec-replace this script during monitor
+                /bin/sh "$prog_dir/custom-test"
+            else
+	        . "$prog_dir/custom-test"
+            fi
+	else
+            if [ "$MONITOR_CMD" != 1 ]; then
+	        _die $err_no_test_script "No test stage defined, make a bin/custom-test to do it."
+            fi
+	fi
+    elif in_runtime_container; then
+        _die $err_no_test_in_runtime "Don't run tests in the runtime container."
+    else
+	# Otherwise spin up a copy of the devenv image to run the test suite.
+        # Is it overkill to not reuse an already-existing devenv via docker exec?
+        # Yes, but having it run independently is safer and cleaner.
+	exec docker run -it --rm \
+	    --env "DEPLOYMENT_STAGE=$DEPLOYMENT_STAGE" \
+	    --volume /var/run/docker.sock:/var/run/docker.sock \
+	    --volume `pwd`:/app \
+	    --name "$PROJECT_APP-test" \
+            $DOCKER_DEVENV_RUN_TEST_ARGS \
+	    "$DOCKER_USER/$PROJECT_APP-devenv:${1:-latest}" \
+            "./bin/docker-devenv" "test"
+    fi
+}
+
+_help_exec() {
+    echo FIXME help exec
+}
+
+_cmd_exec() {
+    exec docker exec -it \
+        $DOCKER_DEVENV_EXEC_DEVENV_ARGS \
+        "$PROJECT_APP-devenv" \
+        "${@:-/bin/sh}"
+}
+
+_help_rexec() {
+    echo FIXME help exec
+}
+
+_cmd_rexec() {
+    exec docker exec -it \
+        $DOCKER_DEVENV_EXEC_RUNTIME_ARGS \
+        "$PROJECT_APP-runtime" \
+        "${@:-/bin/sh}"
+}
+
+_help_monitor() {
+    echo FIXME help monitor
+}
+
+_wait_for_no_input() {
+    while [ true ]; do
+        input=""
+        read -t "$1" input
+        if [ -z "$input" ]; then
+            echo "...changes seem done."
+            break
+        fi
+        echo "Changes are continuing... '$input'"
+    done
+}
+
+_monitor_build_and_run() {
+#    echo "build" && sleep 10 && echo "run" && sleep 60 && echo "exiting"
+    _cmd_build && MONITOR_CMD=1 _cmd_test && _cmd_run
+}
+
+_monitor_kill_build_and_run() {
+    if [ -n "$running_pid" ]; then
+        pkill -P $running_pid >/dev/null 2>&1
+        sleep 0.1
+        kill $running_pid >/dev/null 2>&1
+    fi
+}
+
+_monitor() {
+    running_pid=""
+    debounce="${1:-3}"
+    while [ true ]; do
+	echo "Kill & build & restart."
+	if [ -n "$running_pid" ]; then
+	    echo "...killing $running_pid..."
+            _monitor_kill_build_and_run
+	fi
+	_monitor_build_and_run &
+	running_pid=$!
+	echo "Waiting for file changes..."
+	read input
+	echo "Waiting for no file changes for ${debounce} seconds... '$input'"
+	_wait_for_no_input "$debounce"
+    done
+}
+
+# BS to handle busybox sh's unwillingness to clean up processes on exit
+# somehow still doesn't work thanks to the pipeing with inotifywait.
+_monitor_cleanup() {
+    _monitor_kill_build_and_run
+    # kill all processes whose parent is this process
+    pkill -P $$
+    sleep 5
+}
+
+_monitor_install_traps() {
+    for sig in INT QUIT HUP TERM; do
+      trap "
+	_monitor_cleanup
+	trap - $sig EXIT
+	kill -s $sig "'"$$"' "$sig"
+    done
+    trap _monitor_cleanup EXIT
+}
+
+_cmd_monitor() {
+    if in_devenv_container; then
+         _monitor_install_traps
+	 inotifywait -q -m -r /app @/app/.git -e attrib,modify,create,delete,move | _monitor "$@"
+    else
+        # FIXME _dieify
+	echo "Monitor should only be run within the devenv container via 'docker-devenv run' on the host." 1>&2
+	exit 1
+    fi
+}
+
+_help_help() {
+    _cmd_help
+}
+
+_cmd_help() {
+    if [ -z "$*" ]; then
+        _cmd_version
+        echo "Usage: $prog_name [-v] [-h] [-d] <command> [<args>]
+
+Switches:
+    -v, --version Show version information and exit.
+    -h, --help    Show this help and exit.
+    -d            Enable debug messages, additional -d options increase verbosity.
+
+Basic commands:
+    build         Build the correct part of the devenv stack.
+    run           Run the correct part of the devenv stack.
+    test          Run the test suite in the correct part of the devenv stack.
+    exec [cmd]    Run the given command (or a shell) on the devenv container.
+    rexec [cmd]   Run the given command (or a shell) on the runtime container.
+
+Internal commands:
+    monitor       Monitor the local filesystem within the devenv container for changes and rebuild.
+
+Additional commands:
+    version       Show version information and exit.
+    help          Show this help and exit.
+    update        Update your copy of the docker-devenv script.
+    plugins       Show a list of plugins installed."
+    else
+        #  Dispatch to _help_<cmd> if they've supplied a command name.
+        orig_cmd="$1"
+        shift
+        _normalize_cmd_name "cmd" "$orig_cmd"
+        if [ -z "$cmd" ]; then
+            _cmd_unknown "$orig_cmd"
+        else
+            #  TODO: check the functions exists. Say no help available if it doesn't.
+            something_shown=0
+            declare -f "_usage_${cmd}" >/dev/null
+            if [ "$?" = 0 ]; then
+                _usage_${cmd} "$@"
+                something_shown=1
+            fi
+            declare -f "_help_${cmd}" >/dev/null
+            if [ "$?" = 0 ]; then
+                if [ "$something_shown" = 1 ]; then
+                    echo
+                fi
+                _help_${cmd} "$@"
+                something_shown=1
+            fi
+            if [ "$something_shown" = 0 ]; then
+                echo "No help found for '$prog_name $cmd', try the general help at '$prog_name help'."
+            fi
+        fi
+    fi
+}
+
+_help_version() {
+    echo "Show version information and exit."
+}
+
+_cmd_version() {
+    echo "$prog_name version $version"
+}
+
+_help_update() {
+    echo "FIXME Help update"
+}
+
+_cmd_update() {
+    source="$HOME/projects/docker-devenv/docker-devenv"
+    if [ -n "$DOCKER_DEVENV_UPDATE_LOCAL_SOURCE" ]; then
+        source="$DOCKER_DEVENV_UPDATE_LOCAL_SOURCE"
+	if [ ! -f "$source" ]; then
+	    _die $err_update_no_source "Can't find source file to update from: $source"
+	fi
+	if [ "$source" = `readlink -f -- "$0"` ]; then
+	    _die $err_update_no_write "Can't overwrite source with update."
+	fi
+	echo "Updating from $source to $0"
+	# Exec to a new shell to modify the running script otherwise the buffered read of the
+	# currently executing script gets funky.
+	exec /bin/sh -c "cp '$source' '$0'"
+    else
+        source="$DOCKER_DEVENV_UPDATE_SOURCE"
+	echo "Updating from $source to $0"
+	# Exec to a new shell to modify the running script otherwise the buffered read of the
+	# currently executing script gets funky.
+	exec /bin/sh -c "curl '$source' --output '$0'"
+    fi
+}
+
+_cmd_unknown() {
+    _err "Unknown command '$*', try '$prog_name help' for a list of valid commands."
+    exit 1
+}
+
+_normalize_cmd_name() {
+    #  Clunky way to return value because $() runs in subshell and we want to
+    #  auto-source plugins into the main docker-devenv shell. But we also don't
+    #  want to screw around with fd redirect voodoo at the calling point each
+    #  time to capture process output without a subshell.
+    _varname="$1"
+    _cmd="$2"
+    case "$_cmd" in
+        build)         _cmd="build"     ;;
+        run)           _cmd="run"       ;;
+        test)          _cmd="test"      ;;
+        exec)          _cmd="exec"      ;;
+        rexec)         _cmd="rexec"     ;;
+        monitor|watch) _cmd="monitor"   ;;
+        #  Extra commands.
+        version)       _cmd="version"   ;;
+        ""|help)       _cmd="help"      ;;
+        update)        _cmd="update"    ;;
+        plugins)       _cmd="plugins"   ;;
+        *)
+            if [ -f "$plugins_dir/$_cmd" ]; then
+                . "$plugins_dir/$_cmd"
+            else
+                _cmd=""
+            fi
+            ;;
+    esac
+    eval "${_varname}=\"${_cmd}\""
+}
+
+_dispatch() {
+    orig_cmd="$1"
+    shift
+    _normalize_cmd_name "cmd" "$orig_cmd"
+    if [ -z "$cmd" ]; then
+        _cmd_unknown "$orig_cmd"
+    else
+        _cmd_${cmd} "$@"
+    fi
+}
+
+# Crappy check to see if we're being sourced. POSIX sh makes this hard to test.
+if [ "$prog_name" = "docker-devenv" ]; then
+    debug=0
+    while getopts "hvd-:" "OPTNAME"; do
+	# support long options: https://stackoverflow.com/a/28466267/519360
+	if [ "$OPTNAME" = "-" ]; then     # long option: reformulate OPT and OPTARG
+	    OPTNAME="${OPTARG%%=*}"       # extract long option name
+	    OPTARG="${OPTARG#$OPTNAME}"   # extract long option argument (may be empty)
+	    OPTARG="${OPTARG#=}"          # if long option argument, remove assigning `=`
+	fi
+	case $OPTNAME in
+	    h | help)    _cmd_help; exit 0     ;;
+	    v | version) _cmd_version; exit 0  ;;
+	    d)           debug=$(($debug + 1)) ;;
+	    ??*)         _err "Illegal option --$OPTNAME"; exit -1 ;;  # bad long option
+	    *)           exit -1               ;;
+	esac
+    done
+    shift $(($OPTIND - 1))
+fi
+
+# Run rc file after options processing so that it can inspect arguments.
+# Probably will have issues if argument parsing was skipped because we were sourced?
+_load_config
+
+if [ "$prog_name" = "docker-devenv" ]; then
+    _dispatch "$@"
+fi
